@@ -1,11 +1,15 @@
 import numpy as np
 import urllib.request
 import gzip
+import torch
+import torch.nn.functional as F
 
 # ==========================================
 # 1. 創世種子與數據獲取
 # ==========================================
-np.random.seed(42) # 鎖定初始流形，確保實驗可重現
+torch.manual_seed(42)
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"目前使用的運算設備: {device}")
 
 def get_mnist():
     base_url = "https://ossci-datasets.s3.amazonaws.com/mnist/"
@@ -24,75 +28,74 @@ def get_mnist():
         print(f"數據獲取失敗: {e}")
         return None, None
 
-def inject_label(image, label):
-    """
-    對稱編碼 (Symmetric Encoding): 
-    將前 10 個維度清空，並注入嚴格的 One-Hot 真理，確保能量絕對對稱。
-    """
-    new_img = image.copy()
-    new_img[:10] = 0.0
-    new_img[label] = 1.0 
-    return new_img
+def inject_label_batched(images, labels):
+    new_imgs = images.clone()
+    new_imgs[:, :10] = 0.0
+    batch_indices = torch.arange(images.size(0), device=device)
+    new_imgs[batch_indices, labels] = 1.0 
+    return new_imgs
 
 # ==========================================
-# 2. Logos 核心圖層 (繼承自 XOR 的完美架構)
+# 2. Logos 核心圖層 (無梯度、精準尺度版)
 # ==========================================
-class LogosLayerNumPy:
-    def __init__(self, in_dim, out_dim, lr=0.05, threshold=3.0, beta=0.1):
+class LogosLayer:
+    def __init__(self, in_dim, out_dim, lr=5.0, threshold=3.0, beta=0.1):
         self.in_dim = in_dim
         self.out_dim = out_dim
+        # 【修正 1】：因為批次平均化，學習率必須等比放大。這裡從 0.05 提升至 5.0
         self.lr = lr
         self.threshold = threshold
-        self.beta = beta  # 靜息電位 (過濾高維雜訊)
+        self.beta = beta
         
-        # R+ 雙軌權重初始化
-        scale = np.sqrt(2.0 / in_dim) 
-        self.W_pos = np.random.uniform(0.1, scale, (out_dim, in_dim))
-        self.W_neg = np.random.uniform(0.1, scale, (out_dim, in_dim))
+        scale = np.sqrt(2.0 / in_dim)
+        low, high = min(0.1, scale), max(0.1, scale)
+        self.W_pos = torch.empty(out_dim, in_dim, device=device).uniform_(low, high)
+        self.W_neg = torch.empty(out_dim, in_dim, device=device).uniform_(low, high)
         
-        # Hadamard 正交散射遮罩
-        self.H_pos = np.random.choice([0.8, 1.2], size=in_dim)
+        h_choices = torch.tensor([0.8, 1.2], device=device)
+        idx = torch.randint(0, 2, (in_dim,), device=device)
+        self.H_pos = h_choices[idx]
         self.H_neg = 2.0 - self.H_pos
 
     def _shifted_softplus(self, x):
-        return np.log1p(np.exp(np.clip(x - self.beta, -15, 15)))
+        return torch.log1p(torch.exp(torch.clamp(x - self.beta, min=-15.0, max=15.0)))
 
+    # 加上 no_grad() 裝飾器，徹底釋放 GPU 效能，避免建立無用的運算圖
+    @torch.no_grad()
     def forward_and_update(self, x_input, is_positive=True, update=True):
-        # A. 絕對公平的起跑線：向量長度正規化
-        x_norm = x_input / (np.linalg.norm(x_input) + 1e-8)
+        batch_size = x_input.size(0)
         
-        # B. 雙軌 Hadamard 散射
+        x_norm = x_input / (torch.norm(x_input, dim=1, keepdim=True) + 1e-8)
+        
         x_p = x_norm * self.H_pos
         x_n = x_norm * self.H_neg
         
-        # C. 差動傳導與平移激活
-        excite = self.W_pos @ x_p
-        inhib = self.W_neg @ x_n
-        h = self._shifted_softplus(excite - inhib)
+        excite = F.linear(x_p, self.W_pos)
+        inhib = F.linear(x_n, self.W_neg)
+        h = self._shifted_softplus(excite - inhib) 
         
-        # D. 觀測活躍度 (Goodness)
-        goodness = np.mean(h**2)
+        # 【修正 2】：保留 Batch 的維度，讓每一筆資料都有獨立的能量值
+        goodness = torch.mean(h**2, dim=1) # shape: (Batch_size,)
         
         if update:
-            # E. Sigmoid 機率坍縮
-            p_truth = 1.0 / (1.0 + np.exp(-(goodness - self.threshold)))
+            p_truth = 1.0 / (1.0 + torch.exp(-(goodness - self.threshold))) 
             
             if is_positive:
-                # 觀測真理：強化興奮，退化抑制
-                drive = self.lr * (1.0 - p_truth)
-                self.W_pos += drive * np.outer(h, x_p)
-                self.W_neg -= drive * np.outer(h, x_n)
+                drive = self.lr * (1.0 - p_truth) 
+                h_driven = h * drive.unsqueeze(1) 
+                self.W_pos += torch.matmul(h_driven.T, x_p) / batch_size
+                self.W_neg -= torch.matmul(h_driven.T, x_n) / batch_size
             else:
-                # 觀測虛無：強化抑制 (正向抑制法則)，退化興奮
                 drive = self.lr * p_truth 
-                self.W_neg += drive * np.outer(h, x_n)
-                self.W_pos -= drive * np.outer(h, x_p)
+                h_driven = h * drive.unsqueeze(1)
+                self.W_neg += torch.matmul(h_driven.T, x_n) / batch_size
+                self.W_pos -= torch.matmul(h_driven.T, x_p) / batch_size
             
-            # F. 守護 R+ 生存邊界
-            self.W_pos = np.clip(self.W_pos, 1e-4, 5.0) 
-            self.W_neg = np.clip(self.W_neg, 1e-4, 5.0)
+            # 使用 inplace clamp_ 減少記憶體開銷
+            self.W_pos.clamp_(min=1e-4, max=5.0) 
+            self.W_neg.clamp_(min=1e-4, max=5.0)
             
-        return h, goodness
+        return h, goodness # 回傳完整向量，供推論時精準計算
 
 # ==========================================
 # 3. 實驗執行區
@@ -100,74 +103,77 @@ class LogosLayerNumPy:
 images, labels = get_mnist()
 
 if images is not None:
-    # 為了快速驗證演算法威力，我們抽取 5000 筆資料作為宇宙切片
-    limit = 5000 
-    train_x, train_y = images[:limit], labels[:limit]
+    limit = 50000 
     
-    # 初始化網路：784(像素) -> 512(高維散射) -> 128(特徵收斂)
-    # 沿用 XOR 驗證成功的超參數: lr=0.05, threshold=3.0, beta=0.1
-    l1 = LogosLayerNumPy(784, 512, lr=0.05, threshold=3.0, beta=0.1)
-    l2 = LogosLayerNumPy(512, 128, lr=0.05, threshold=3.0, beta=0.1)
+    train_x = torch.tensor(images[:limit], dtype=torch.float32, device=device)
+    train_y = torch.tensor(labels[:limit], dtype=torch.long, device=device)
     
-    print(f"\n⚡ 開始 Logos MNIST 大一統訓練 (樣本: {limit}, Epochs: 15)...")
+    # 建立模型時，傳入放大的學習率 lr=5.0
+    l1 = LogosLayer(784, 512, lr=2.0, threshold=0.6, beta=0.1)
+    l2 = LogosLayer(512, 128, lr=2.0, threshold=0.6, beta=0.1)
     
-    indices = np.arange(len(train_x))
-    for epoch in range(15): # NumPy 處理 5000 筆 15 個 Epoch 大約只需幾分鐘
-        np.random.shuffle(indices)
+    batch_size = 256
+    num_samples = len(train_x)
+    
+    print(f"\n⚡ 開始 Logos MNIST 大一統訓練 (樣本: {limit}, Batch: {batch_size}, Epochs: 15)...")
+    
+    for epoch in range(50):
+        indices = torch.randperm(num_samples, device=device)
+        train_x = train_x[indices]
+        train_y = train_y[indices]
         
         total_g_pos = 0.0
         total_g_neg = 0.0
+        batches = 0
         
-        for idx, i in enumerate(indices):
-            # 1. 注入真理 (正樣本)
-            x_pos = inject_label(train_x[i], train_y[i])
+        for i in range(0, num_samples, batch_size):
+            batch_x = train_x[i:i+batch_size]
+            batch_y = train_y[i:i+batch_size]
+            
+            # 1. 正樣本
+            x_pos = inject_label_batched(batch_x, batch_y)
             h1_p, g1_p = l1.forward_and_update(x_pos, is_positive=True)
             _, g2_p = l2.forward_and_update(h1_p, is_positive=True)
             
-            # 2. 注入虛無 (負樣本)
-            wrong_label = (train_y[i] + np.random.randint(1, 10)) % 10
-            x_neg = inject_label(train_x[i], wrong_label)
+            # 2. 負樣本
+            wrong_labels = (batch_y + torch.randint(1, 10, (len(batch_y,),), device=device)) % 10
+            x_neg = inject_label_batched(batch_x, wrong_labels)
             h1_n, g1_n = l1.forward_and_update(x_neg, is_positive=False)
             _, g2_n = l2.forward_and_update(h1_n, is_positive=False)
             
-            # 收集第一層的能量用於觀測
-            total_g_pos += g1_p
-            total_g_neg += g1_n
-            
-            if idx % 1000 == 0 and idx > 0:
-                print(f"  已處理 {idx} 個視覺切片...")
-                
-        avg_pos = total_g_pos / len(train_x)
-        avg_neg = total_g_neg / len(train_x)
+            # g1_p 是 Batch 向量，取 mean 後再加總
+            total_g_pos += g1_p.mean().item()
+            total_g_neg += g1_n.mean().item()
+            batches += 1
+
+        avg_pos = total_g_pos / batches
+        avg_neg = total_g_neg / batches
         print(f"Epoch {epoch:2d} | 真理能量: {avg_pos:6.2f} | 虛無能量: {avg_neg:6.2f} | 差距(對比度): {avg_pos - avg_neg:6.2f}")
 
     # ==========================================
-    # 4. 非線性解析測試 (推論)
+    # 4. 非線性解析測試 (修正推論邏輯)
     # ==========================================
-    print("\n🚀 訓練完成。正在進行 500 筆未知的視覺推論測試...")
-    correct = 0
-    test_size = 500
+    print("\n🚀 訓練完成。正在進行未知視覺推論測試...")
+    test_size = 10000
+    test_x = torch.tensor(images[-test_size:], dtype=torch.float32, device=device)
+    test_y = torch.tensor(labels[-test_size:], dtype=torch.long, device=device)
     
-    # 取最後 500 筆作為測試集 (確保沒看過)
-    test_x = images[-test_size:]
-    test_y = labels[-test_size:]
+    all_scores = torch.zeros((test_size, 10), device=device)
     
-    for i in range(test_size):
-        img = test_x[i]
-        true_l = test_y[i]
-        
-        scores = []
+    # 關閉梯度進行推論測試
+    with torch.no_grad():
         for cand in range(10):
-            # 假設該圖片是 cand (0~9)
-            x_test = inject_label(img, cand)
+            cand_labels = torch.full((test_size,), cand, dtype=torch.long, device=device)
+            x_test = inject_label_batched(test_x, cand_labels)
+            
+            # 【關鍵修復】：直接依賴 forward_and_update 的內部計算，保證正規化流程一致
             h1, g1 = l1.forward_and_update(x_test, update=False)
             _, g2 = l2.forward_and_update(h1, update=False)
             
-            # 總共鳴能量
-            scores.append(g1 + g2) 
-        
-        # 能量最高的假設即為 Logos 的預測
-        if np.argmax(scores) == true_l:
-            correct += 1
+            # 將兩層的 Goodness 相加作為最終信心分數
+            all_scores[:, cand] = g1 + g2
+            
+    predictions = torch.argmax(all_scores, dim=1)
+    correct = (predictions == test_y).sum().item()
             
     print(f"\n🎯 最終視覺解析率 (Accuracy): {correct/test_size * 100:.2f}%")
